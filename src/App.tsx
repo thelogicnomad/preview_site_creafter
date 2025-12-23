@@ -6,6 +6,7 @@ import { WebContainerPreview } from './components/WebContainerPreview';
 import type { FileNode } from './utils/fileUtils';
 import { extractZip, toWebContainerFS, findRootPrefix, flattenFiles } from './utils/zipUtils';
 import { useWebContainer } from './hooks/useWebContainer';
+import { parseStackTrace } from './utils/errorReporter';
 import { Play, FileArchive, RotateCcw, Zap, Sparkles, Database, Loader2, Wand2, CheckCircle, AlertTriangle } from 'lucide-react';
 
 const API_URL = 'http://localhost:3001';
@@ -169,6 +170,41 @@ function App() {
             return () => clearTimeout(timeoutId);
         }
     }, [terminalOutput, isRunning, isFixing, parseError, fixCodeError]);
+
+    // Listen for runtime errors from preview iframe
+    useEffect(() => {
+        const handleRuntimeError = (event: MessageEvent) => {
+            // Only process runtime error messages
+            if (event.data?.type !== 'RUNTIME_ERROR') return;
+            if (!isRunning || fixingRef.current || isFixing) return;
+            if (fixAttempts.current >= MAX_FIX_ATTEMPTS) return;
+
+            const { message, stack, errorType } = event.data;
+            console.log('🔴 Runtime error received:', { message, stack, errorType });
+
+            // Parse stack trace to find file
+            const { filePath } = parseStackTrace(stack || '');
+
+            if (filePath) {
+                // Create error string with context
+                const errorContext = `Runtime Error (${errorType})\n${message}\n\nStack trace:\n${stack}`;
+
+                setFixLog(prev => [...prev, `🔴 Runtime Error in ${filePath}`]);
+
+                // Trigger fix with a slight delay
+                setTimeout(() => {
+                    fixCodeError(filePath, errorContext);
+                }, 1500);
+            } else {
+                console.warn('Could not extract file path from runtime error:', stack);
+                setFixLog(prev => [...prev, `⚠️ Runtime error detected but file path not found`]);
+            }
+        };
+
+        window.addEventListener('message', handleRuntimeError);
+        return () => window.removeEventListener('message', handleRuntimeError);
+    }, [isRunning, isFixing, fixCodeError]);
+
 
     const handleFileUpload = useCallback(async (file: File) => {
         setIsExtracting(true);
@@ -336,7 +372,7 @@ function App() {
                         <div className="flex gap-3 overflow-x-auto">
                             {fixLog.slice(-6).map((log, i) => (
                                 <span key={i} className={`whitespace-nowrap ${log.includes('✅') ? 'text-emerald-400' :
-                                        log.includes('❌') ? 'text-red-400' : 'text-zinc-400'
+                                    log.includes('❌') ? 'text-red-400' : 'text-zinc-400'
                                     }`}>
                                     {log}
                                 </span>
