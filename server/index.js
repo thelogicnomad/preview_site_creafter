@@ -73,7 +73,47 @@ app.post('/api/fix-error', async (req, res) => {
             });
         }
 
-        const prompt = `You are an expert React/TypeScript developer. Fix the following error in this code.
+        // Detect if this is a runtime error
+        const isRuntimeError = error.includes('Runtime Error') ||
+            error.includes('RUNTIME_ERROR') ||
+            error.includes('error boundary') ||
+            error.includes('The above error occurred');
+
+        const prompt = isRuntimeError
+            ? `You are an expert React/TypeScript developer. Fix the following RUNTIME ERROR in this code.
+
+## Runtime Error Details:
+\`\`\`
+${error}
+\`\`\`
+
+## File: ${filePath}
+\`\`\`tsx
+${fileContent}
+\`\`\`
+
+## Instructions for Runtime Errors:
+1. This is a RUNTIME error that occurred in the browser, not a build error
+2. Common runtime errors include:
+   - Accessing properties of undefined/null (cannot read property 'x' of undefined)
+   - React component errors (hooks, render errors)
+   - Unhandled promise rejections
+   - Type errors (undefined is not a function)
+3. Look for:
+   - Missing null/undefined checks
+   - Incorrect hook usage (hooks called conditionally)
+   - Accessing array/object properties without validation
+   - Missing optional chaining (?.)
+   - Async errors without try-catch
+4. Fix the code to prevent the runtime error
+5. Add defensive programming (null checks, optional chaining, fallbacks)
+6. Keep all existing functionality
+7. Return ONLY the complete fixed code
+8. Do NOT include markdown code fences or explanations
+9. The response should be valid TypeScript/React code
+
+## Fixed Code:`
+            : `You are an expert React/TypeScript developer. Fix the following error in this code.
 
 ## Error Message:
 \`\`\`

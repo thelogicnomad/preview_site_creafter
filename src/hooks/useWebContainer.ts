@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { WebContainer } from '@webcontainer/api';
 import type { FileSystemTree } from '@webcontainer/api';
+import { getErrorReporterScript } from '../utils/errorReporter';
 
 interface UseWebContainerReturn {
     isBooting: boolean;
@@ -239,6 +240,27 @@ export function useWebContainer(): UseWebContainerReturn {
                 await preWarmPromise;
             }
             appendOutput('📁 Mounting project files...');
+
+            // Inject error reporter into index.html
+            if (files['index.html']) {
+                const indexHtmlEntry = files['index.html'];
+                if ('file' in indexHtmlEntry && indexHtmlEntry.file && 'contents' in indexHtmlEntry.file) {
+                    const originalHtml = indexHtmlEntry.file.contents;
+                    const errorReporter = getErrorReporterScript();
+
+                    // Inject error reporter after <head> tag
+                    const modifiedHtml = typeof originalHtml === 'string'
+                        ? originalHtml.replace('</head>', `  ${errorReporter}\n  </head>`)
+                        : originalHtml;
+
+                    files['index.html'] = {
+                        file: { contents: modifiedHtml }
+                    };
+
+                    appendOutput('🔍 Error reporter injected');
+                }
+            }
+
             await instance.mount(files);
             appendOutput('✅ Files mounted');
         } catch (err) {
