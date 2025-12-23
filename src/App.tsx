@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { ZipUpload } from './components/ZipUpload';
 import { FileExplorer } from './components/FileExplorer';
 import { CodeEditor } from './components/CodeEditor';
@@ -6,13 +6,30 @@ import { WebContainerPreview } from './components/WebContainerPreview';
 import type { FileNode } from './utils/fileUtils';
 import { extractZip, toWebContainerFS, findRootPrefix, flattenFiles } from './utils/zipUtils';
 import { useWebContainer } from './hooks/useWebContainer';
-import { Play, FileArchive, RotateCcw, Zap, Sparkles, Database, Loader2 } from 'lucide-react';
+import { Play, FileArchive, RotateCcw, Zap, Sparkles, Database, Loader2, Wand2, CheckCircle, AlertTriangle } from 'lucide-react';
+
+const API_URL = 'http://localhost:3001';
+const MAX_FIX_ATTEMPTS = 15;
 
 function App() {
     const [files, setFiles] = useState<FileNode[]>([]);
     const [selectedFile, setSelectedFile] = useState<FileNode | null>(null);
     const [isExtracting, setIsExtracting] = useState(false);
     const [zipName, setZipName] = useState<string>('');
+    const [isFixing, setIsFixing] = useState(false);
+    const [fixCount, setFixCount] = useState(0);
+    const [currentAction, setCurrentAction] = useState<string | null>(null);
+    const [fixLog, setFixLog] = useState<string[]>([]);
+
+    const fixingRef = useRef(false);
+    const fixAttempts = useRef(0);
+    const lastErrorRef = useRef<string>('');
+    const filesRef = useRef<FileNode[]>([]);
+
+    // Keep files ref in sync
+    useEffect(() => {
+        filesRef.current = files;
+    }, [files]);
 
     const {
         isBooting,
@@ -25,23 +42,152 @@ function App() {
         isPreWarming,
         mountFiles,
         startDevServer,
+        updateFile,
         reset,
     } = useWebContainer();
+
+    // Parse error from terminal output
+    const parseError = useCallback((output: string[]): { file: string; error: string } | null => {
+        const text = output.slice(-60).join('\n');
+
+        // Check for various error patterns
+        const patterns = [
+            // Vite resolve error
+            /Failed to resolve import ["']([^"']+)["'] from ["']([^"']+)["']/,
+            // Module not found
+            /Cannot find module ['"]([^'"]+)['"]/,
+            // X is not defined
+            /(\w+) is not defined/,
+            // Syntax/Type errors
+            /(SyntaxError|TypeError|ReferenceError):\s*(.+?)(?:\n|$)/,
+        ];
+
+        for (const pattern of patterns) {
+            if (pattern.test(text)) {
+                const fileMatch = text.match(/(?:src\/[\w\-\/]+\.tsx?)/);
+                if (fileMatch) {
+                    return { file: fileMatch[0], error: text.slice(-500) };
+                }
+            }
+        }
+
+        return null;
+    }, []);
+
+    // Fix code error using LLM
+    const fixCodeError = useCallback(async (errorFile: string, errorText: string) => {
+        if (fixingRef.current) return false;
+
+        const errorKey = `${errorFile}:${errorText.slice(0, 50)}`;
+        if (errorKey === lastErrorRef.current) return false;
+        lastErrorRef.current = errorKey;
+
+        fixingRef.current = true;
+        setIsFixing(true);
+        setCurrentAction(`Fixing: ${errorFile}`);
+        fixAttempts.current++;
+
+        try {
+            const allFiles = flattenFiles(filesRef.current);
+
+            let targetFile = allFiles.find(f =>
+                f.path === errorFile ||
+                f.path.endsWith(errorFile) ||
+                f.path.includes(errorFile.replace('src/', ''))
+            );
+
+            if (!targetFile?.content) {
+                const fileName = errorFile.split('/').pop();
+                if (fileName) {
+                    targetFile = allFiles.find(f => f.name === fileName);
+                }
+            }
+
+            if (!targetFile?.content) {
+                setFixLog(prev => [...prev, `❌ File not found: ${errorFile}`]);
+                return false;
+            }
+
+            console.log(`🔧 Fixing code in: ${targetFile.path}`);
+            setFixLog(prev => [...prev, `🔧 Fixing: ${targetFile.path}`]);
+
+            const response = await fetch(`${API_URL}/api/fix-error`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    error: errorText,
+                    filePath: targetFile.path,
+                    fileContent: targetFile.content,
+                }),
+            });
+
+            if (!response.ok) throw new Error('Backend failed');
+
+            const { fixedCode } = await response.json();
+
+            if (fixedCode && fixedCode !== targetFile.content) {
+                await updateFile(targetFile.path, fixedCode);
+
+                const updateFileInTree = (nodes: FileNode[]): FileNode[] => {
+                    return nodes.map(node => {
+                        if (node.path === targetFile!.path) {
+                            return { ...node, content: fixedCode };
+                        }
+                        if (node.children) {
+                            return { ...node, children: updateFileInTree(node.children) };
+                        }
+                        return node;
+                    });
+                };
+                setFiles(updateFileInTree(filesRef.current));
+                setFixCount(prev => prev + 1);
+                setFixLog(prev => [...prev, `✅ Fixed: ${targetFile.path}`]);
+                return true;
+            }
+        } catch (err) {
+            console.error('Fix failed:', err);
+            setFixLog(prev => [...prev, `❌ Error: ${err}`]);
+        } finally {
+            fixingRef.current = false;
+            setIsFixing(false);
+            setCurrentAction(null);
+        }
+        return false;
+    }, [updateFile]);
+
+    // Watch terminal and auto-fix
+    useEffect(() => {
+        if (!isRunning || fixingRef.current || isFixing) return;
+        if (fixAttempts.current >= MAX_FIX_ATTEMPTS) return;
+
+        const errorInfo = parseError(terminalOutput);
+        if (errorInfo && errorInfo.file) {
+            const timeoutId = setTimeout(() => {
+                fixCodeError(errorInfo.file, errorInfo.error);
+            }, 2000);
+
+            return () => clearTimeout(timeoutId);
+        }
+    }, [terminalOutput, isRunning, isFixing, parseError, fixCodeError]);
 
     const handleFileUpload = useCallback(async (file: File) => {
         setIsExtracting(true);
         setZipName(file.name);
+        setFixCount(0);
+        setFixLog([]);
+        fixAttempts.current = 0;
+        lastErrorRef.current = '';
         reset();
 
         try {
             const extracted = await extractZip(file);
             setFiles(extracted);
+            filesRef.current = extracted;
 
             const allFiles = flattenFiles(extracted);
             if (allFiles.length > 0) {
                 const mainFile = allFiles.find(f =>
-                    f.name === 'App.tsx' || f.name === 'App.jsx' ||
-                    f.name === 'index.tsx' || f.name === 'index.jsx'
+                    f.name === 'App.tsx' || f.name === 'App.jsx'
                 ) || allFiles[0];
                 setSelectedFile(mainFile);
             }
@@ -55,6 +201,10 @@ function App() {
     const handleStartPreview = useCallback(async () => {
         if (files.length === 0) return;
 
+        fixAttempts.current = 0;
+        lastErrorRef.current = '';
+        setFixLog([]);
+
         const prefix = findRootPrefix(files);
         const fsTree = toWebContainerFS(files, prefix);
 
@@ -66,6 +216,10 @@ function App() {
         setFiles([]);
         setSelectedFile(null);
         setZipName('');
+        setFixCount(0);
+        setFixLog([]);
+        fixAttempts.current = 0;
+        lastErrorRef.current = '';
         reset();
     }, [reset]);
 
@@ -76,6 +230,12 @@ function App() {
     }, []);
 
     const totalFiles = flattenFiles(files).length;
+    const hasActiveError = terminalOutput.slice(-20).some(line =>
+        line.includes('Failed to resolve') ||
+        line.includes('Cannot find module') ||
+        line.includes('is not defined') ||
+        line.includes('Error')
+    );
 
     return (
         <div className="h-screen w-screen bg-zinc-950 text-white flex flex-col overflow-hidden">
@@ -94,22 +254,44 @@ function App() {
                         </h1>
                         <p className="text-xs text-zinc-500 flex items-center gap-1">
                             <Sparkles className="w-3 h-3" />
-                            WebContainers
+                            WebContainers + AI Auto-Fix
                         </p>
                     </div>
 
-                    {/* Status badge */}
-                    {isPreWarming ? (
+                    {isPreWarming && (
                         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            Installing 16 base packages...
+                            Installing base packages...
                         </div>
-                    ) : isPreWarmed ? (
+                    )}
+
+                    {isPreWarmed && !isPreWarming && (
                         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                             <Database className="w-3.5 h-3.5" />
-                            Ready - Fast Load!
+                            Ready
                         </div>
-                    ) : null}
+                    )}
+
+                    {isFixing && (
+                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-purple-500/10 text-purple-400 border border-purple-500/20 animate-pulse">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            {currentAction || 'AI Fixing...'}
+                        </div>
+                    )}
+
+                    {hasActiveError && !isFixing && (
+                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+                            <AlertTriangle className="w-3.5 h-3.5" />
+                            Error detected
+                        </div>
+                    )}
+
+                    {fixCount > 0 && (
+                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <CheckCircle className="w-3.5 h-3.5" />
+                            {fixCount} fixed
+                        </div>
+                    )}
                 </div>
 
                 <div className="flex items-center gap-3">
@@ -146,6 +328,24 @@ function App() {
                 </div>
             </header>
 
+            {/* Fix activity log */}
+            {fixLog.length > 0 && (
+                <div className="px-6 py-2 bg-zinc-900/80 border-b border-zinc-800/50 overflow-x-auto">
+                    <div className="flex items-center gap-3 text-xs">
+                        <Wand2 className="w-4 h-4 text-purple-400 flex-shrink-0" />
+                        <div className="flex gap-3 overflow-x-auto">
+                            {fixLog.slice(-6).map((log, i) => (
+                                <span key={i} className={`whitespace-nowrap ${log.includes('✅') ? 'text-emerald-400' :
+                                        log.includes('❌') ? 'text-red-400' : 'text-zinc-400'
+                                    }`}>
+                                    {log}
+                                </span>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Main content */}
             <div className="flex-1 flex overflow-hidden">
                 {files.length === 0 ? (
@@ -157,7 +357,7 @@ function App() {
                                     Upload a React project ZIP file
                                 </p>
                                 <p className="text-zinc-600 text-sm mt-2">
-                                    Upload → Start Preview → See your app!
+                                    Start Preview → Errors detected → AI auto-fixes → Preview updates
                                 </p>
                             </div>
                         </div>

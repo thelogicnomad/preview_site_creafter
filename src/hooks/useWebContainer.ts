@@ -13,6 +13,7 @@ interface UseWebContainerReturn {
     isPreWarming: boolean;
     mountFiles: (files: FileSystemTree) => Promise<void>;
     startDevServer: () => Promise<void>;
+    updateFile: (path: string, content: string) => Promise<void>;
     reset: () => void;
 }
 
@@ -289,6 +290,16 @@ export function useWebContainer(): UseWebContainerReturn {
         }
     }, [boot, appendOutput]);
 
+    const updateFile = useCallback(async (path: string, content: string) => {
+        try {
+            const instance = await boot();
+            await instance.fs.writeFile(path, content);
+            appendOutput(`✏️ Updated: ${path}`);
+        } catch (err) {
+            appendOutput(`❌ Failed to update ${path}: ${err}`);
+        }
+    }, [boot, appendOutput]);
+
     const reset = useCallback(() => {
         if (processRef.current) {
             processRef.current.kill();
@@ -316,6 +327,7 @@ export function useWebContainer(): UseWebContainerReturn {
         isPreWarming,
         mountFiles,
         startDevServer,
+        updateFile,
         reset,
     };
 }
